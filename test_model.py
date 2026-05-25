@@ -1,8 +1,9 @@
-from ultralytics import YOLO
 import torch
 
+from ultralytics import YOLO
+
 # 加载自定义模型
-model = YOLO('yolov8n_basketball.yaml')
+model = YOLO("yolov8n_basketball.yaml")
 
 # 打印模型结构，确认DCNv3和BGAM模块已插入
 print(model.model)
