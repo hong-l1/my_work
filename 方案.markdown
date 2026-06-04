@@ -1,0 +1,69 @@
+# Role & Task
+你是一个顶级的计算机视觉（CV）算法专家和精通 Ultralytics YOLO 框架的高级 PyTorch 工程师。
+请根据以下给出的【物理动机】、【数据流演进】和【精确数学公式】，编写一个即插即用的 PyTorch 自定义层模块，名为 `C2f_DCNv3_GSGAM`，并编写配套的自定义损失函数（Loss Function）钩子代码。
+
+---
+
+# 1. 模块输入与输出规格 (IO Specification)
+- 输入特征图: `x`，维度为 `[B, c1, H, W]`（部署在 YOLOv8/v10 的 P2 高分辨率层，通常 H=160, W=160）。
+- 输出特征图: `f_gsgam`，维度为 `[B, c2, H, W]`。
+- 初始化参数: `c1` (输入通道), `c2` (输出通道), `n` (C2f内Bottleneck重复次数, 默认1), `shortcut` (默认False), `g` (分组数, 默认1), `e` (C2f内部通道缩放系数, 默认0.5), `K` (GS-GAM的独立头数量/DCNv3分组数, 默认4)。
+
+---
+
+# 2. 级联架构与代码逻辑流 (Cascaded Pipeline)
+
+该模块由三个子阶段串联组成，请在一个统一的 `C2f_DCNv3_GSGAM` 类中实现它们：
+
+### 阶段一：C2f(P2) 特征提取
+1. 采用 YOLOv8 标准的 C2f 结构。输入 `x` 经过 `cv1` (1x1 Conv) 映射为 `2 * c` 个通道（其中 `c = int(c2 * e)`）。
+2. 在通道维度使用 `torch.chunk(..., chunks=2, dim=1)` 拆分为两个分支 `y0` 和 `y1`。
+3. `y1` 分支连续通过 `n` 个标准的 YOLO `Bottleneck` 模块，将所有中间特征与 `y0`、`y1` 进行 `torch.cat` 拼接。
+4. 拼接后的特征通过 `cv2` (1x1 Conv) 映射回 `c2` 通道，得到基础特征图 `f_c2f`（维度：`[B, c2, H, W]`）。
+
+### 阶段二：DCNv3 空间可微分采样
+1. 将 `f_c2f` 输入 DCNv3 算子进行各向异性动态形态建模，得到形变增强特征 `f_dcn`（维度：`[B, c2, H, W]`）。
+2. 【代码防御机制】：由于 DCNv3 需要编译额外的 C++ 算子，请在代码顶部使用 `try...except...` 结构尝试导入官方的 `from ops_dcnv3.modules.dcnv3 import DCNv3`。如果导入失败，请自动降级为一个普通的组卷积（Group Convolution）来模拟动态通道分组（`nn.Conv2d(c2, c2, kernel_size=3, padding=1, groups=K)`），并在注释中发出 Warning，确保代码具有高鲁棒性。
+
+### 阶段三：GS-GAM（组结构几何稀疏门控注意力模块）
+这是核心组件，请严格按照以下多头子空间解耦与门控逻辑编写：
+
+1. **多头子空间分解**：将 `f_dcn` 沿通道轴切分为 `K` 个独立的子空间（独立头），每个头的维度为 `[B, d_k, H, W]`，其中 `d_k = c2 // K`（添加 `assert c2 % K == 0` 的断言防护）。
+2. **并行双流门控**：
+   对于第 `i` 个头（$i \in [0, K-1]$）：
+   - **语义感知流 (Semantic Stream)**：通过一个轻量化的 $1\times1$ 卷积，计算该头的单通道高维语义响应图 $S_i$（维度：`[B, 1, H, W]`）。
+   - **几何先验锚定流 (Geometric Prior Stream)**：内生一个 `MM_GAB` (Multi-Morphological Geometric Anchoring Block) 子模块。
+
+3. **MM_GAB 与可微变结构基元库 (DVP-Bank) 实现规范**：
+   `MM_GAB` 接收当前头的特征 $F_i$ `[B, d_k, H, W]`：
+   - 内部构建 4 个并行的卷积算子（DVP-Bank）：
+     - $\mathcal{K}_{iso\_s}$: `kernel_size=3, padding=1`（等向小尺度）
+     - $\mathcal{K}_{iso\_l}$: `kernel_size=3, padding=2, dilation=2`（等向大尺度）
+     - $\mathcal{K}_{ani\_h}$: `kernel_size=(1, 7), padding=(0, 3)`（异向水平条带）
+     - $\mathcal{K}_{ani\_v}$: `kernel_size=(7, 1), padding=(3, 0)`（异向垂直条带）
+   - 利用全局平均池化（GAP）将 $F_i$ 压缩为 `[B, d_k]`，然后通过一个轻量化 MLP（`nn.Linear` $\rightarrow$ `nn.SiLU` $\rightarrow$ `nn.Linear`），输出维度为 `[B, 4]` 的自适应形态分配系数 $\boldsymbol{\alpha}_i$。对 `dim=-1` 使用 `F.softmax` 进行归一化。
+   - 使用 $\boldsymbol{\alpha}_i$ 对 4 个算子的输出进行矩阵级加权融合：
+     $$G_i' = \alpha_i^1 \cdot \mathcal{K}_{iso\_s}(F_i) + \alpha_i^2 \cdot \mathcal{K}_{iso\_l}(F_i) + \alpha_i^3 \cdot \mathcal{K}_{ani\_h}(F_i) + \alpha_i^4 \cdot \mathcal{K}_{ani\_v}(F_i)$$
+   - 将融合后的 $G_i'$ 经过一个 $1\times1$ 卷积压缩通道，并使用 `torch.sigmoid` 激活，生成显式空间几何掩码 $G_i$（维度：`[B, 1, H, W]`）。
+
+4. **哈达玛复合门控与极致稀疏清洗**：
+   - 将语义图 $S_i$ 与几何掩码 $G_i$ 做哈达玛积（元素级乘法 `*`）。
+   - 门控分数计算公式为：$g_i = \text{torch.sigmoid}(S_i \times G_i)$。
+   - 用 $g_i$ 调制该头的特征：$F_i' = F_i \times g_i$。
+   - 【关键要求】：在类中创建一个实例属性列表 `self.saved_G_i = []`，在每次 `forward` 时，将所有头生成的 $G_i$ 清空并重新 `append` 进去，以便后续损失函数调用。
+
+5. **非线性残差还原**：
+   - 将所有头的精纯特征 $F_i'$ 重新拼接到一起：`torch.cat(..., dim=1)`。
+   - 经过一个 `nn.SiLU()` 激活函数进行非线性增强。
+   - 与阶段二输出的 `f_dcn` 进行恒等残差相加（Shortcut）：`f_gsgam = f_dcn + f_gated`。
+
+---
+
+# 3. 几何分布协同损失函数 ($\mathcal{L}_{GDA}$) 规范
+请另外编写一个独立的自定义损失函数计算函数或类 `GeometricDistributionAlignmentLoss`：
+1. **理想高斯热力图生成**：给定当前 Batch 中 Ground Truth 边界框的中心坐标 $(x_c, y_c)$ 和对应的目标宽高 $(w_{gt}, h_{gt})$，在 $H \times W$ 的坐标系上投影生成理想的连续二维高斯概率热力图 $\hat{G}$（维度：`[B, 1, H, W]`），其中心点处值为 1，向四周高斯衰减。
+2. **连续型 KL 散度约束**：将 `model.saved_G_i` 中缓存的 $K$ 个概率掩码 $G_i$ 分别与 $\hat{G}$ 计算连续 Kullback-Leibler 散度损失。
+3. **公式实现指引**：
+   $$\mathcal{L}_{GDA} = \frac{1}{K} \sum_{i=1}^{K} \text{F.kl\_div}(\text{torch.log}(G_i + \epsilon), \hat{G}, \text{reduction='batchmean'})$$
+   请确保处理好数值稳定性，防止出现 `log(0)`。
+现在，请开始生成完整且优雅的代码。

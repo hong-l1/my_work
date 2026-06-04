@@ -191,6 +191,63 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+class GeometricDistributionAlignmentLoss(nn.Module):
+    """KL-based geometric mask alignment loss for GS-GAM heads."""
+
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def _build_heatmap(
+        self, bboxes: torch.Tensor, mask_gt: torch.Tensor, shape: tuple[int, int], stride: float
+    ) -> torch.Tensor:
+        """Project GT boxes to a continuous Gaussian heatmap on the feature map."""
+        b, _, _ = bboxes.shape
+        h, w = shape
+        device = bboxes.device
+        dtype = bboxes.dtype
+        yy, xx = torch.meshgrid(
+            torch.arange(h, device=device, dtype=dtype),
+            torch.arange(w, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        xx = xx.view(1, 1, h, w)
+        yy = yy.view(1, 1, h, w)
+
+        x1, y1, x2, y2 = bboxes.unbind(-1)
+        cx = ((x1 + x2) * 0.5 / stride).view(b, -1, 1, 1)
+        cy = ((y1 + y2) * 0.5 / stride).view(b, -1, 1, 1)
+        sx = ((x2 - x1).clamp_min(stride) / stride * 0.5).view(b, -1, 1, 1)
+        sy = ((y2 - y1).clamp_min(stride) / stride * 0.5).view(b, -1, 1, 1)
+
+        gauss = torch.exp(-0.5 * (((xx - cx) / (sx + self.eps)) ** 2 + ((yy - cy) / (sy + self.eps)) ** 2))
+        gauss = gauss * mask_gt.squeeze(-1).unsqueeze(-1).unsqueeze(-1).to(dtype)
+        heatmap = gauss.amax(dim=1, keepdim=True)
+        flat = heatmap.flatten(2).sum(-1, keepdim=True).clamp_min(self.eps)
+        return (heatmap / flat.view(b, 1, 1, 1)).clamp_min(self.eps)
+
+    def forward(
+        self,
+        saved_masks: list[torch.Tensor],
+        gt_bboxes: torch.Tensor,
+        mask_gt: torch.Tensor,
+        stride: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Average KL divergence between saved geometric masks and the ideal Gaussian target."""
+        if not saved_masks:
+            ref = gt_bboxes.sum() if gt_bboxes.numel() else mask_gt.sum()
+            return ref * 0.0
+
+        stride_value = float(stride.max().item() if isinstance(stride, torch.Tensor) else stride)
+        target = self._build_heatmap(gt_bboxes, mask_gt, saved_masks[0].shape[-2:], stride_value)
+        losses = []
+        for mask in saved_masks:
+            pred = mask.clamp_min(self.eps)
+            pred = pred / pred.flatten(2).sum(-1, keepdim=True).view(pred.shape[0], 1, 1, 1).clamp_min(self.eps)
+            losses.append(F.kl_div(torch.log(pred), target, reduction="batchmean"))
+        return torch.stack(losses).mean()
+
+
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
@@ -212,7 +269,12 @@ class v8DetectionLoss:
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.gda_loss = GeometricDistributionAlignmentLoss().to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.gda_gain = getattr(h, "gda", 0.0)
+        self.geometric_modules = [
+            module for module in model.model.modules() if hasattr(module, "saved_G_i") and hasattr(module, "K")
+        ]
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
@@ -242,7 +304,7 @@ class v8DetectionLoss:
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, gda
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -295,9 +357,17 @@ class v8DetectionLoss:
                 fg_mask,
             )
 
+        if self.gda_gain > 0 and self.geometric_modules:
+            saved_masks = []
+            for module in self.geometric_modules:
+                saved_masks.extend(mask for mask in getattr(module, "saved_G_i", []) if isinstance(mask, torch.Tensor))
+            if saved_masks:
+                loss[3] = self.gda_loss(saved_masks, gt_bboxes, mask_gt, self.stride[0])
+
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= self.gda_gain
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 

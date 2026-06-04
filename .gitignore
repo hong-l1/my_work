@@ -199,3 +199,7 @@ calibration_*.npy
 *.heic
 *.ico
 *.raw
+
+# Local dataset and notes
+/pappu-1/
+/方案.markdown

@@ -12,6 +12,11 @@ from ultralytics.utils.torch_utils import fuse_conv_and_bn
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
+try:
+    from ops_dcnv3.modules.dcnv3 import DCNv3 as OfficialDCNv3
+except Exception:
+    OfficialDCNv3 = None
+
 __all__ = (
     "C1",
     "C2",
@@ -32,6 +37,7 @@ __all__ = (
     "Bottleneck",
     "BottleneckCSP",
     "C2f",
+    "C2f_DCNv3_GSGAM",
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
@@ -474,6 +480,113 @@ class Bottleneck(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply bottleneck with optional shortcut connection."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class _DCNv3Adapter(nn.Module):
+    """Wrap DCNv3 with a grouped-convolution fallback for environments without the compiled op."""
+
+    def __init__(self, channels: int, groups: int):
+        super().__init__()
+        self.channels_last = False
+        self.op = None
+        if OfficialDCNv3 is not None:
+            candidates = (
+                {"channels": channels, "kernel_size": 3, "stride": 1, "pad": 1, "dilation": 1, "group": groups},
+                {"channels": channels, "kernel_size": 3, "stride": 1, "padding": 1, "dilation": 1, "group": groups},
+                {"channels": channels, "kernel_size": 3, "stride": 1, "pad": 1, "group": groups},
+            )
+            for kwargs in candidates:
+                try:
+                    self.op = OfficialDCNv3(**kwargs)
+                    break
+                except TypeError:
+                    continue
+            self.channels_last = self.op is not None
+
+        # Warning: this fallback is only an approximation of DCNv3 and keeps the project runnable without extra ops.
+        if self.op is None:
+            self.op = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, groups=groups, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run DCNv3 when available, otherwise use grouped convolution."""
+        if not self.channels_last:
+            return self.op(x)
+
+        try:
+            y = self.op(x.permute(0, 2, 3, 1).contiguous())
+            if y.ndim == 4:
+                return y.permute(0, 3, 1, 2).contiguous()
+        except Exception:
+            pass
+        return self.op(x)
+
+
+class _MMGAB(nn.Module):
+    """Multi-morphological geometric anchoring block used by each GS-GAM head."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        hidden = max(channels // 2, 4)
+        self.iso_s = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.iso_l = nn.Conv2d(channels, channels, kernel_size=3, padding=2, dilation=2, bias=False)
+        self.ani_h = nn.Conv2d(channels, channels, kernel_size=(1, 7), padding=(0, 3), bias=False)
+        self.ani_v = nn.Conv2d(channels, channels, kernel_size=(7, 1), padding=(3, 0), bias=False)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(nn.Linear(channels, hidden), nn.SiLU(), nn.Linear(hidden, 4))
+        self.compress = nn.Conv2d(channels, 1, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Build an explicit geometric mask for a single head."""
+        alpha = F.softmax(self.mlp(self.gap(x).flatten(1)), dim=-1)
+        fused = (
+            self.iso_s(x) * alpha[:, 0].view(-1, 1, 1, 1)
+            + self.iso_l(x) * alpha[:, 1].view(-1, 1, 1, 1)
+            + self.ani_h(x) * alpha[:, 2].view(-1, 1, 1, 1)
+            + self.ani_v(x) * alpha[:, 3].view(-1, 1, 1, 1)
+        )
+        return torch.sigmoid(self.compress(fused))
+
+
+class C2f_DCNv3_GSGAM(nn.Module):
+    """C2f + DCNv3 + GS-GAM module for high-resolution small-object enhancement."""
+
+    def __init__(
+        self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5, K: int = 4
+    ):
+        super().__init__()
+        assert c2 % K == 0, f"c2={c2} must be divisible by K={K}."
+        self.c = int(c2 * e)
+        self.K = K
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1, 1)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.dcn = _DCNv3Adapter(c2, K)
+        head_channels = c2 // K
+        self.semantic_heads = nn.ModuleList(nn.Conv2d(head_channels, 1, kernel_size=1, bias=True) for _ in range(K))
+        self.geometry_heads = nn.ModuleList(_MMGAB(head_channels) for _ in range(K))
+        self.act = nn.SiLU()
+        self.saved_G_i = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the C2f stem, deformable sampling, and GS-GAM gating cascade."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        f_c2f = self.cv2(torch.cat(y, 1))
+        f_dcn = self.dcn(f_c2f)
+
+        self.saved_G_i = []
+        gated_heads = []
+        for feat_i, semantic_head, geometry_head in zip(
+            torch.chunk(f_dcn, self.K, dim=1), self.semantic_heads, self.geometry_heads
+        ):
+            s_i = semantic_head(feat_i)
+            g_i = geometry_head(feat_i)
+            self.saved_G_i.append(g_i)
+            gate = torch.sigmoid(s_i * g_i)
+            gated_heads.append(feat_i * gate)
+
+        f_gated = self.act(torch.cat(gated_heads, dim=1))
+        return f_dcn + f_gated
 
 
 class BottleneckCSP(nn.Module):
