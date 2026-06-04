@@ -574,7 +574,7 @@ class C2f_DCNv3_GSGAM(nn.Module):
         f_c2f = self.cv2(torch.cat(y, 1))
         f_dcn = self.dcn(f_c2f)
 
-        should_cache_masks = self.training and torch.is_grad_enabled()
+        should_cache_masks = True
         self.saved_G_i = []
         gated_heads = []
         for feat_i, semantic_head, geometry_head in zip(
@@ -583,7 +583,7 @@ class C2f_DCNv3_GSGAM(nn.Module):
             s_i = semantic_head(feat_i)
             g_i = geometry_head(feat_i)
             if should_cache_masks:
-                self.saved_G_i.append(g_i)
+                self.saved_G_i.append(g_i if (self.training and torch.is_grad_enabled()) else g_i.detach().clone())
             gate = torch.sigmoid(s_i * g_i)
             gated_heads.append(feat_i * gate)
 
